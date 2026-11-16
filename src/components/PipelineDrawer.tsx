@@ -1,13 +1,18 @@
 import { useState } from 'react';
-import { PanelRightClose, PanelRightOpen } from 'lucide-react';
+import { PanelRightClose, PanelRightOpen, Sparkles } from 'lucide-react';
 import type {
   AgentId,
   Candle,
   ClosedTrade,
+  ExecutionOrderRecord,
+  FeedHealthStatus,
+  GeminiAdvisoryResponse,
   OrderbookLevel,
+  PaperReconciliationReport,
   PipelineCycle,
   PipelineStage,
   Position,
+  StrategyConfig,
 } from '../engine/types';
 import { MarketMiniChart } from './MarketMiniChart';
 import { OrderbookAndLedgerTab, OrderExecutionDesk } from './OrderExecutionPanel';
@@ -27,23 +32,41 @@ interface PipelineDrawerProps {
   orderbookBids: OrderbookLevel[];
   orderbookAsks: OrderbookLevel[];
   orderbookImbalance: number;
+  orderbookSource?: 'EXCHANGE_DEPTH' | 'UNAVAILABLE';
   liveTrades: ClosedTrade[];
+  orders: ExecutionOrderRecord[];
+  reconciliation?: PaperReconciliationReport | null;
   isUsingLiveStream: boolean;
-  onOpenOrder: (side: 'LONG' | 'SHORT') => void;
+  config: StrategyConfig;
+  emergencyStopActive: boolean;
+  dataQuality: FeedHealthStatus;
+  manualRejectionReason: string | null;
+  onDismissRejection: () => void;
+  onToggleEmergencyStop: () => void;
+  onOpenOrder: (
+    side: 'LONG' | 'SHORT',
+    options?: { orderType: 'MARKET' | 'LIMIT'; limitPrice?: number },
+  ) => void;
+  onCancelOrder?: (clientOrderId: string) => void;
   onClosePosition: (closeRatio: 0.5 | 1) => void;
+  geminiAdvisory: GeminiAdvisoryResponse | null;
+  geminiLoading: boolean;
+  onRequestGeminiAdvisory: () => void;
 }
 
 const STAGE_LABELS: Array<{ stage: PipelineStage; agentId: AgentId; step: string }> = [
   { stage: 'INGEST_MARKET', agentId: 'macro_scout', step: '01' },
   { stage: 'QUANT_CONFLUENCE', agentId: 'quant_analyst', step: '02' },
   { stage: 'ORDERFLOW_SCAN', agentId: 'orderflow_radar', step: '03' },
-  { stage: 'RISK_VETO_GATE', agentId: 'risk_guardian', step: '04' },
-  { stage: 'EXECUTION_SYNC', agentId: 'execution_commander', step: '05' },
+  { stage: 'STRATEGY_SYNTHESIS', agentId: 'strategy_architect', step: '04' },
+  { stage: 'RISK_VETO_GATE', agentId: 'risk_guardian', step: '05' },
+  { stage: 'EXECUTION_SYNC', agentId: 'execution_commander', step: '06' },
 ];
 
 function directionTextColor(dir: string): string {
   if (dir === 'LONG') return 'text-emerald-400';
   if (dir === 'SHORT' || dir === 'VETO') return 'text-rose-400';
+  if (dir === 'UNAVAILABLE') return 'text-amber-400';
   return 'text-slate-400';
 }
 
@@ -51,6 +74,7 @@ function directionLabel(dir: string): string {
   if (dir === 'LONG') return 'MUA (LONG)';
   if (dir === 'SHORT') return 'BÁN (SHORT)';
   if (dir === 'VETO') return 'CHẶN (VETO)';
+  if (dir === 'UNAVAILABLE') return 'UNAVAILABLE';
   return 'QUAN SÁT';
 }
 
@@ -69,10 +93,23 @@ export function PipelineDrawer({
   orderbookBids,
   orderbookAsks,
   orderbookImbalance,
+  orderbookSource = 'UNAVAILABLE',
   liveTrades,
+  orders,
+  reconciliation,
   isUsingLiveStream,
+  config,
+  emergencyStopActive,
+  dataQuality,
+  manualRejectionReason,
+  onDismissRejection,
+  onToggleEmergencyStop,
   onOpenOrder,
+  onCancelOrder,
   onClosePosition,
+  geminiAdvisory,
+  geminiLoading,
+  onRequestGeminiAdvisory,
 }: PipelineDrawerProps) {
   const [drawerTab, setDrawerTab] = useState<'council' | 'orders'>('council');
 
@@ -97,7 +134,7 @@ export function PipelineDrawer({
   return (
     <aside
       aria-label="Bảng điều phối Hội đồng Agents và Đặt lệnh"
-      className="fixed top-28 md:top-16 right-4 bottom-3 md:bottom-24 w-[376px] max-w-[calc(100vw-2rem)] bg-[#0C121E] border border-white/12 rounded-xl z-30 flex flex-col overflow-hidden shadow-2xl"
+      className="fixed top-28 md:top-16 right-4 bottom-3 md:bottom-24 w-[380px] max-w-[calc(100vw-2rem)] bg-[#0C121E] border border-white/12 rounded-xl z-30 flex flex-col overflow-hidden shadow-2xl"
     >
       {/* Header */}
       <div className="px-4 py-3 border-b border-white/10 flex items-center justify-between gap-3 shrink-0">
@@ -121,19 +158,24 @@ export function PipelineDrawer({
 
       {/* Scrollable Body */}
       <div className="flex-1 overflow-y-auto p-4 space-y-4">
-        {/* Mini Candlestick & Entry/SL/TP1/TP2 Chart */}
         <MarketMiniChart candles={candles} activePosition={activePosition} />
 
-        {/* Prestigious Buy/Sell & Active Position Management Desk */}
         <OrderExecutionDesk
           activePosition={activePosition}
           cycle={cycle}
           currentPrice={currentPrice}
+          config={config}
+          emergencyStopActive={emergencyStopActive}
+          dataQuality={dataQuality}
+          reconciliation={reconciliation}
+          manualRejectionReason={manualRejectionReason}
+          onDismissRejection={onDismissRejection}
+          onToggleEmergencyStop={onToggleEmergencyStop}
           onOpenOrder={onOpenOrder}
           onClosePosition={onClosePosition}
         />
 
-        {/* Segmented Switch: 5 Agents Council | Orderbook & Session Ledger */}
+        {/* Segmented Switch: 6 Agents Council | Orderbook & Session Ledger */}
         <div className="pt-3 border-t border-white/10 space-y-3">
           <div
             role="tablist"
@@ -151,7 +193,7 @@ export function PipelineDrawer({
                   : 'text-slate-400 hover:text-white'
               }`}
             >
-              Hội đồng 5 Agents
+              Hội đồng 6 Agents
             </button>
             <button
               type="button"
@@ -171,6 +213,43 @@ export function PipelineDrawer({
 
           {drawerTab === 'council' ? (
             <div className="space-y-3">
+              {/* Optional Server-Side Gemini AI Advisory */}
+              <div className="p-2.5 rounded-lg bg-[#070B12] border border-white/10 space-y-1.5">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[11px] font-semibold text-slate-200 flex items-center gap-1.5">
+                    <Sparkles className="w-3.5 h-3.5 text-amber-400" aria-hidden="true" />
+                    <span>Gemini Advisory (Tham khảo)</span>
+                  </span>
+                  <button
+                    type="button"
+                    onClick={onRequestGeminiAdvisory}
+                    disabled={geminiLoading}
+                    className="px-2 py-1 text-[10px] font-semibold rounded bg-white/8 hover:bg-white/15 text-amber-300 disabled:opacity-50 cursor-pointer whitespace-nowrap"
+                  >
+                    {geminiLoading ? 'Đang hỏi...' : 'Xin ý kiến AI'}
+                  </button>
+                </div>
+                {geminiAdvisory ? (
+                  <div className="text-[11px] text-slate-300 space-y-1">
+                    <div className="font-mono tabular-nums flex items-center justify-between">
+                      <span>
+                        Khuyến nghị:{' '}
+                        <strong className="text-amber-300">{geminiAdvisory.verdict}</strong>
+                      </span>
+                      {geminiAdvisory.configured && (
+                        <span className="text-slate-400">{geminiAdvisory.confidencePct}%</span>
+                      )}
+                    </div>
+                    <p className="text-slate-400 leading-snug">{geminiAdvisory.rationale}</p>
+                    <p className="text-[10px] text-slate-500 italic">{geminiAdvisory.disclaimer}</p>
+                  </div>
+                ) : (
+                  <p className="text-[10px] text-slate-500">
+                    Độc lập với Risk Guardian — chỉ dùng tham khảo rủi ro thị trường.
+                  </p>
+                )}
+              </div>
+
               {cycle?.debate && (
                 <div
                   data-testid="drawer-debate-summary"
@@ -226,7 +305,7 @@ export function PipelineDrawer({
               )}
 
               <div className="flex items-center justify-between text-xs text-slate-400">
-                <span>Luồng cộng tác 5 Agents</span>
+                <span>Luồng cộng tác 6 Agents</span>
                 <span>Nhấn để soi 3D</span>
               </div>
 
@@ -289,8 +368,12 @@ export function PipelineDrawer({
               orderbookBids={orderbookBids}
               orderbookAsks={orderbookAsks}
               orderbookImbalance={orderbookImbalance}
+              orderbookSource={orderbookSource}
               liveTrades={liveTrades}
+              orders={orders}
+              reconciliation={reconciliation}
               isUsingLiveStream={isUsingLiveStream}
+              onCancelOrder={onCancelOrder}
             />
           )}
         </div>

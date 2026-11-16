@@ -1,531 +1,351 @@
+import 'dotenv/config';
 import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { DEFAULT_STRATEGY_CONFIG } from './src/engine/multiAgentEngine';
+import type {
+  ClosedTrade,
+  ExecutionMode,
+  HealthDependencyEntry,
+  MarketVenue,
+  Position,
+  RiskAccountState,
+  RiskEventRecord,
+  StrategyConfig,
+  TimeframeKey,
+} from './src/engine/types';
+import {
+  ExchangeExecutionService,
+  getExchangeCredentialsStatus,
+} from './src/server/exchangeExecutor';
+import { generateGeminiQuantAdvisory } from './src/server/geminiAdvisor';
+import { MarketDataHub } from './src/server/marketDataService';
+import { QuantRepository } from './src/server/repository';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT || 3000);
 
-export interface RawKline {
-  time: number;
-  open: number;
-  high: number;
-  low: number;
-  close: number;
-  volume: number;
-}
+const VALID_VENUES = new Set<MarketVenue>(['BINANCE_SPOT', 'BINANCE_FUTURES']);
+const VALID_MODES = new Set<ExecutionMode>(['SIMULATION', 'PAPER', 'TESTNET', 'LIVE']);
+const VALID_INTERVALS = new Set<TimeframeKey>(['5m', '15m', '1h', '4h', '1d']);
 
-export type MarketFeedSource =
-  | 'binance_ws_live'
-  | 'binance_rest_live'
-  | 'coinbase_live'
-  | 'quant_engine_sim';
-
-export interface OrderbookLevel {
-  price: number;
-  qty: number;
-  total: number;
-}
-
-export interface HtfContext {
-  h1Bias: 'LONG' | 'SHORT' | 'NEUTRAL';
-  h4Bias: 'LONG' | 'SHORT' | 'NEUTRAL';
-  h1Rsi: number;
-  h1Ema50: number;
-}
-
-interface LiveMarketState {
-  source: MarketFeedSource;
-  candles: RawKline[];
-  price: number;
-  change24hPct: number;
-  high24h: number;
-  low24h: number;
-  volume24hUsd: number;
-  bestBid: number;
-  bestAsk: number;
-  orderbookImbalance: number;
-  orderbookBids: OrderbookLevel[];
-  orderbookAsks: OrderbookLevel[];
-  fundingRate: number;
-  htfContext?: HtfContext;
-  updatedAt: number;
-}
-
-function calcEma(values: number[], period: number): number {
-  if (values.length === 0) return 0;
-  const k = 2 / (period + 1);
-  let ema = values[0];
-  for (let i = 1; i < values.length; i++) {
-    ema = values[i] * k + ema * (1 - k);
-  }
-  return ema;
-}
-
-function calcRsi(closes: number[], period = 14): number {
-  if (closes.length < period + 1) return 50;
-  let gains = 0;
-  let losses = 0;
-  for (let i = 1; i <= period; i++) {
-    const diff = closes[i] - closes[i - 1];
-    if (diff >= 0) gains += diff;
-    else losses += Math.abs(diff);
-  }
-  let avgGain = gains / period;
-  let avgLoss = losses / period;
-  for (let i = period + 1; i < closes.length; i++) {
-    const diff = closes[i] - closes[i - 1];
-    avgGain = (avgGain * (period - 1) + (diff > 0 ? diff : 0)) / period;
-    avgLoss = (avgLoss * (period - 1) + (diff < 0 ? Math.abs(diff) : 0)) / period;
-  }
-  if (avgLoss === 0) return 100;
-  return Number((100 - 100 / (1 + avgGain / avgLoss)).toFixed(1));
-}
-
-function computeHtfContext(h1Closes: number[], h4Closes: number[]): HtfContext {
-  const lastH1 = h1Closes[h1Closes.length - 1] ?? 0;
-  const h1Ema21 = calcEma(h1Closes, 21);
-  const h1Ema50 = calcEma(h1Closes, 50);
-  const h1Rsi = calcRsi(h1Closes, 14);
-
-  let h1Bias: HtfContext['h1Bias'] = 'NEUTRAL';
-  if (lastH1 > h1Ema21 && h1Ema21 > h1Ema50 && h1Rsi >= 48) h1Bias = 'LONG';
-  else if (lastH1 < h1Ema21 && h1Ema21 < h1Ema50 && h1Rsi <= 52) h1Bias = 'SHORT';
-
-  const lastH4 = h4Closes[h4Closes.length - 1] ?? 0;
-  const h4Ema12 = calcEma(h4Closes, 12);
-  const h4Ema26 = calcEma(h4Closes, 26);
-
-  let h4Bias: HtfContext['h4Bias'] = 'NEUTRAL';
-  if (lastH4 > h4Ema12 && h4Ema12 > h4Ema26) h4Bias = 'LONG';
-  else if (lastH4 < h4Ema12 && h4Ema12 < h4Ema26) h4Bias = 'SHORT';
-
-  return {
-    h1Bias,
-    h4Bias,
-    h1Rsi,
-    h1Ema50: Number(h1Ema50.toFixed(2)),
+function createRateLimiter(maxRequests: number, windowMs: number) {
+  const hits = new Map<string, { count: number; resetAt: number }>();
+  return (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    const key = `${req.ip || 'local'}:${req.path}`;
+    const now = Date.now();
+    const bucket = hits.get(key);
+    if (!bucket || now > bucket.resetAt) {
+      hits.set(key, { count: 1, resetAt: now + windowMs });
+      next();
+      return;
+    }
+    bucket.count++;
+    if (bucket.count > maxRequests) {
+      res.status(429).json({
+        ok: false,
+        error: 'Quá nhiều yêu cầu trong thời gian ngắn (Rate limit). Vui lòng thử lại sau.',
+      });
+      return;
+    }
+    next();
   };
 }
 
-function buildTopDepthLevels(raw: Array<[string, string]>, limit = 5): OrderbookLevel[] {
-  let running = 0;
-  return raw.slice(0, limit).map(([pStr, qStr]) => {
-    const price = Number(pStr);
-    const qty = Number(qStr);
-    running += qty;
-    return {
-      price,
-      qty: Number(qty.toFixed(4)),
-      total: Number(running.toFixed(4)),
-    };
-  });
-}
+function sanitizeConfigInput(raw: unknown, base: StrategyConfig): StrategyConfig {
+  if (!raw || typeof raw !== 'object') return base;
+  const r = raw as Partial<StrategyConfig>;
+  const clamp = (val: unknown, min: number, max: number, fallback: number) => {
+    const n = Number(val);
+    return Number.isFinite(n) ? Math.max(min, Math.min(max, n)) : fallback;
+  };
 
-const BINANCE_REST_HOSTS = [
-  'https://data-api.binance.vision',
-  'https://api.binance.com',
-  'https://api1.binance.com',
-  'https://api2.binance.com',
-  'https://api3.binance.com',
-];
-
-const BINANCE_WS_HOSTS = [
-  'wss://data-stream.binance.vision/stream?streams=btcusdt@ticker/btcusdt@kline_15m/btcusdt@depth20@1000ms',
-  'wss://stream.binance.com:9443/stream?streams=btcusdt@ticker/btcusdt@kline_15m/btcusdt@depth20@1000ms',
-];
-
-let liveState: LiveMarketState | null = null;
-const sseClients = new Set<express.Response>();
-let lastBroadcastAt = 0;
-let wsConn: WebSocket | null = null;
-let wsHostIndex = 0;
-let wsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
-let restPollTimer: ReturnType<typeof setInterval> | null = null;
-let inflightRestRefresh: Promise<LiveMarketState | null> | null = null;
-
-function broadcastTick(force = false): void {
-  if (!liveState || sseClients.size === 0) return;
-  const now = Date.now();
-  if (!force && now - lastBroadcastAt < 500) return;
-  lastBroadcastAt = now;
-
-  const payload = `data: ${JSON.stringify({
-    source: liveState.source,
-    price: liveState.price,
-    change24hPct: liveState.change24hPct,
-    high24h: liveState.high24h,
-    low24h: liveState.low24h,
-    volume24hUsd: liveState.volume24hUsd,
-    bestBid: liveState.bestBid,
-    bestAsk: liveState.bestAsk,
-    orderbookImbalance: liveState.orderbookImbalance,
-    orderbookBids: liveState.orderbookBids,
-    orderbookAsks: liveState.orderbookAsks,
-    fundingRate: liveState.fundingRate,
-    htfContext: liveState.htfContext,
-    updatedAt: liveState.updatedAt,
-    latestCandle: liveState.candles[liveState.candles.length - 1] ?? null,
-  })}\n\n`;
-
-  for (const res of sseClients) {
-    try {
-      res.write(payload);
-    } catch {
-      sseClients.delete(res);
-    }
-  }
-}
-
-async function fetchJsonWithTimeout<T>(url: string, ms = 3500): Promise<T> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), ms);
-  try {
-    const res = await fetch(url, { signal: controller.signal });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return (await res.json()) as T;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-async function fetchFromBinanceRest(): Promise<LiveMarketState | null> {
-  for (const host of BINANCE_REST_HOSTS) {
-    try {
-      const [klinesJson, h1Json, h4Json, tickerJson, depthJson, fundingJson] = await Promise.all([
-        fetchJsonWithTimeout<Array<Array<string | number>>>(
-          `${host}/api/v3/klines?symbol=BTCUSDT&interval=15m&limit=200`,
-        ),
-        fetchJsonWithTimeout<Array<Array<string | number>>>(
-          `${host}/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=64`,
-        ).catch(() => null),
-        fetchJsonWithTimeout<Array<Array<string | number>>>(
-          `${host}/api/v3/klines?symbol=BTCUSDT&interval=4h&limit=48`,
-        ).catch(() => null),
-        fetchJsonWithTimeout<{
-          lastPrice: string;
-          priceChangePercent: string;
-          highPrice: string;
-          lowPrice: string;
-          quoteVolume: string;
-          bidPrice?: string;
-          askPrice?: string;
-        }>(`${host}/api/v3/ticker/24hr?symbol=BTCUSDT`),
-        fetchJsonWithTimeout<{
-          bids: Array<[string, string]>;
-          asks: Array<[string, string]>;
-        }>(`${host}/api/v3/depth?symbol=BTCUSDT&limit=20`).catch(() => null),
-        fetchJsonWithTimeout<{ lastFundingRate?: string }>(
-          'https://fapi.binance.com/fapi/v1/premiumIndex?symbol=BTCUSDT',
-        ).catch(() => null),
-      ]);
-
-      const candles: RawKline[] = klinesJson.map((k) => ({
-        time: Number(k[0]),
-        open: Number(k[1]),
-        high: Number(k[2]),
-        low: Number(k[3]),
-        close: Number(k[4]),
-        volume: Number(k[5]),
-      }));
-
-      const h1Closes = h1Json ? h1Json.map((k) => Number(k[4])) : candles.filter((_, i) => i % 4 === 3).map((c) => c.close);
-      const h4Closes = h4Json ? h4Json.map((k) => Number(k[4])) : h1Closes.filter((_, i) => i % 4 === 3);
-      const htfContext = computeHtfContext(h1Closes, h4Closes);
-
-      const price = Number(tickerJson.lastPrice);
-      let bestBid = Number(tickerJson.bidPrice || price);
-      let bestAsk = Number(tickerJson.askPrice || price);
-      let orderbookImbalance = 0;
-      let orderbookBids: OrderbookLevel[] = [];
-      let orderbookAsks: OrderbookLevel[] = [];
-
-      if (depthJson && depthJson.bids.length > 0 && depthJson.asks.length > 0) {
-        bestBid = Number(depthJson.bids[0][0]);
-        bestAsk = Number(depthJson.asks[0][0]);
-        orderbookBids = buildTopDepthLevels(depthJson.bids, 5);
-        orderbookAsks = buildTopDepthLevels(depthJson.asks, 5);
-        const bidVol = depthJson.bids.reduce((s, b) => s + Number(b[1]), 0);
-        const askVol = depthJson.asks.reduce((s, a) => s + Number(a[1]), 0);
-        const total = bidVol + askVol;
-        orderbookImbalance = total > 0 ? Number(((bidVol - askVol) / total).toFixed(4)) : 0;
-      }
-
-      const fundingRate = fundingJson?.lastFundingRate
-        ? Number(fundingJson.lastFundingRate)
-        : liveState?.fundingRate ?? 0.0001;
-
-      return {
-        source: wsConn && wsConn.readyState === WebSocket.OPEN ? 'binance_ws_live' : 'binance_rest_live',
-        candles,
-        price,
-        change24hPct: Number(tickerJson.priceChangePercent),
-        high24h: Number(tickerJson.highPrice),
-        low24h: Number(tickerJson.lowPrice),
-        volume24hUsd: Number(tickerJson.quoteVolume),
-        bestBid,
-        bestAsk,
-        orderbookImbalance,
-        orderbookBids,
-        orderbookAsks,
-        fundingRate,
-        htfContext,
-        updatedAt: Date.now(),
-      };
-    } catch {
-      // Try next Binance mirror host
-    }
-  }
-  return null;
-}
-
-async function fetchFromCoinbaseFallback(): Promise<LiveMarketState | null> {
-  try {
-    const [candlesJson, tickerJson, statsJson] = await Promise.all([
-      fetchJsonWithTimeout<Array<[number, number, number, number, number, number]>>(
-        'https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=900',
+  return {
+    initialCapital: clamp(r.initialCapital, 1000, 10000000, base.initialCapital),
+    sizingMethod:
+      r.sizingMethod === 'HALF_KELLY' || r.sizingMethod === 'FIXED_FRACTIONAL'
+        ? r.sizingMethod
+        : base.sizingMethod,
+    riskPerTradePct: clamp(r.riskPerTradePct, 0.25, 3.0, base.riskPerTradePct),
+    maxLeverage: clamp(r.maxLeverage, 1, 5, base.maxLeverage),
+    maxDailyLossPct: clamp(r.maxDailyLossPct, 0.5, 15, base.maxDailyLossPct),
+    maxWeeklyLossPct: clamp(r.maxWeeklyLossPct, 1, 30, base.maxWeeklyLossPct),
+    maxDrawdownPct: clamp(r.maxDrawdownPct, 2, 40, base.maxDrawdownPct),
+    maxConsecutiveLosses: Math.round(
+      clamp(r.maxConsecutiveLosses, 1, 10, base.maxConsecutiveLosses),
+    ),
+    cooldownMinutesAfterLoss: Math.round(
+      clamp(r.cooldownMinutesAfterLoss, 1, 240, base.cooldownMinutesAfterLoss),
+    ),
+    maxSpreadBps: clamp(r.maxSpreadBps, 2, 100, base.maxSpreadBps),
+    minConsensusScore: Math.round(clamp(r.minConsensusScore, 50, 95, base.minConsensusScore)),
+    minRewardRisk: clamp(r.minRewardRisk, 1.2, 5.0, base.minRewardRisk),
+    autoExecute: typeof r.autoExecute === 'boolean' ? r.autoExecute : base.autoExecute,
+    useBreakEvenAfterTp1:
+      typeof r.useBreakEvenAfterTp1 === 'boolean'
+        ? r.useBreakEvenAfterTp1
+        : base.useBreakEvenAfterTp1,
+    vetoChoppyMarket:
+      typeof r.vetoChoppyMarket === 'boolean' ? r.vetoChoppyMarket : base.vetoChoppyMarket,
+    requireClosedCandle:
+      typeof r.requireClosedCandle === 'boolean'
+        ? r.requireClosedCandle
+        : base.requireClosedCandle,
+    marketVenue:
+      r.marketVenue && VALID_VENUES.has(r.marketVenue) ? r.marketVenue : base.marketVenue,
+    executionMode:
+      r.executionMode && VALID_MODES.has(r.executionMode) ? r.executionMode : base.executionMode,
+    agentWeights: {
+      macro_scout: clamp(r.agentWeights?.macro_scout, 0.05, 0.8, base.agentWeights.macro_scout),
+      quant_analyst: clamp(
+        r.agentWeights?.quant_analyst,
+        0.05,
+        0.8,
+        base.agentWeights.quant_analyst,
       ),
-      fetchJsonWithTimeout<{ price: string; bid: string; ask: string; volume: string }>(
-        'https://api.exchange.coinbase.com/products/BTC-USD/ticker',
+      orderflow_radar: clamp(
+        r.agentWeights?.orderflow_radar,
+        0.05,
+        0.8,
+        base.agentWeights.orderflow_radar,
       ),
-      fetchJsonWithTimeout<{ open: string; high: string; low: string; volume: string }>(
-        'https://api.exchange.coinbase.com/products/BTC-USD/stats',
-      ),
-    ]);
-
-    const sorted = candlesJson
-      .slice(0, 120)
-      .reverse()
-      .map((c) => ({
-        time: Number(c[0]) * 1000,
-        low: Number(c[1]),
-        high: Number(c[2]),
-        open: Number(c[3]),
-        close: Number(c[4]),
-        volume: Number(c[5]),
-      }));
-
-    if (sorted.length === 0) return null;
-    const price = Number(tickerJson.price);
-    const open24 = Number(statsJson.open || sorted[0].open);
-    const change24hPct = open24 > 0 ? Number((((price - open24) / open24) * 100).toFixed(2)) : 0;
-
-    return {
-      source: 'coinbase_live',
-      candles: sorted,
-      price,
-      change24hPct,
-      high24h: Number(statsJson.high || price),
-      low24h: Number(statsJson.low || price),
-      volume24hUsd: Number(statsJson.volume || 0) * price,
-      bestBid: Number(tickerJson.bid || price),
-      bestAsk: Number(tickerJson.ask || price),
-      orderbookImbalance: 0,
-      orderbookBids: tickerJson.bid ? [{ price: Number(tickerJson.bid), qty: 0.5, total: 0.5 }] : [],
-      orderbookAsks: tickerJson.ask ? [{ price: Number(tickerJson.ask), qty: 0.5, total: 0.5 }] : [],
-      fundingRate: 0.0001,
-      updatedAt: Date.now(),
-    };
-  } catch {
-    return null;
-  }
+    },
+  };
 }
 
-async function refreshRestSnapshot(): Promise<LiveMarketState | null> {
-  if (inflightRestRefresh) return inflightRestRefresh;
-
-  inflightRestRefresh = (async () => {
-    const binance = await fetchFromBinanceRest();
-    if (binance && binance.candles.length > 0) {
-      // Preserve freshest WS tick price if WS is actively streaming
-      if (liveState && wsConn && wsConn.readyState === WebSocket.OPEN) {
-        liveState.fundingRate = binance.fundingRate;
-        liveState.htfContext = binance.htfContext;
-        if (liveState.candles.length === 0) {
-          liveState.candles = binance.candles;
-        }
-      } else {
-        liveState = binance;
-        broadcastTick(true);
-      }
-      return liveState;
-    }
-
-    const coinbase = await fetchFromCoinbaseFallback();
-    if (coinbase && coinbase.candles.length > 0) {
-      liveState = coinbase;
-      broadcastTick(true);
-      return liveState;
-    }
-
-    return liveState;
-  })().finally(() => {
-    inflightRestRefresh = null;
-  });
-
-  return inflightRestRefresh;
-}
-
-function startBinanceWebSocket(): void {
-  if (wsConn && (wsConn.readyState === WebSocket.OPEN || wsConn.readyState === WebSocket.CONNECTING)) {
-    return;
-  }
-
-  try {
-    const streamUrl = BINANCE_WS_HOSTS[wsHostIndex % BINANCE_WS_HOSTS.length];
-    const ws = new WebSocket(streamUrl);
-    wsConn = ws;
-
-    ws.addEventListener('open', () => {
-      if (liveState) {
-        liveState.source = 'binance_ws_live';
-      }
-    });
-
-    ws.addEventListener('message', (event) => {
-      if (!liveState) return;
-      try {
-        const msg = JSON.parse(String(event.data)) as {
-          stream?: string;
-          data?: Record<string, unknown>;
-        };
-        if (!msg.stream || !msg.data) return;
-
-        if (msg.stream.includes('@ticker')) {
-          const d = msg.data as {
-            c?: string;
-            P?: string;
-            h?: string;
-            l?: string;
-            q?: string;
-            b?: string;
-            a?: string;
-          };
-          if (d.c) liveState.price = Number(d.c);
-          if (d.P) liveState.change24hPct = Number(d.P);
-          if (d.h) liveState.high24h = Number(d.h);
-          if (d.l) liveState.low24h = Number(d.l);
-          if (d.q) liveState.volume24hUsd = Number(d.q);
-          if (d.b) liveState.bestBid = Number(d.b);
-          if (d.a) liveState.bestAsk = Number(d.a);
-          liveState.source = 'binance_ws_live';
-          liveState.updatedAt = Date.now();
-
-          // Sync latest candle close/high/low with tick
-          const last = liveState.candles[liveState.candles.length - 1];
-          if (last) {
-            last.close = liveState.price;
-            if (liveState.price > last.high) last.high = liveState.price;
-            if (liveState.price < last.low) last.low = liveState.price;
-          }
-          broadcastTick(false);
-        } else if (msg.stream.includes('@kline_15m')) {
-          const k = (msg.data as { k?: Record<string, string | number> }).k;
-          if (!k) return;
-          const candle: RawKline = {
-            time: Number(k.t),
-            open: Number(k.o),
-            high: Number(k.h),
-            low: Number(k.l),
-            close: Number(k.c),
-            volume: Number(k.v),
-          };
-          const last = liveState.candles[liveState.candles.length - 1];
-          if (last && last.time === candle.time) {
-            liveState.candles[liveState.candles.length - 1] = candle;
-          } else if (!last || candle.time > last.time) {
-            liveState.candles = [...liveState.candles.slice(-199), candle];
-          }
-          liveState.price = candle.close;
-          liveState.source = 'binance_ws_live';
-          liveState.updatedAt = Date.now();
-          broadcastTick(false);
-        } else if (msg.stream.includes('@depth20')) {
-          const d = msg.data as {
-            bids?: Array<[string, string]>;
-            asks?: Array<[string, string]>;
-          };
-          if (d.bids && d.asks && d.bids.length > 0 && d.asks.length > 0) {
-            liveState.bestBid = Number(d.bids[0][0]);
-            liveState.bestAsk = Number(d.asks[0][0]);
-            liveState.orderbookBids = buildTopDepthLevels(d.bids, 5);
-            liveState.orderbookAsks = buildTopDepthLevels(d.asks, 5);
-            const bidVol = d.bids.reduce((s, b) => s + Number(b[1]), 0);
-            const askVol = d.asks.reduce((s, a) => s + Number(a[1]), 0);
-            const total = bidVol + askVol;
-            if (total > 0) {
-              liveState.orderbookImbalance = Number(((bidVol - askVol) / total).toFixed(4));
-            }
-            broadcastTick(false);
-          }
-        }
-      } catch {
-        // Ignore malformed frame
-      }
-    });
-
-    ws.addEventListener('close', () => {
-      wsConn = null;
-      wsHostIndex = (wsHostIndex + 1) % BINANCE_WS_HOSTS.length;
-      if (!wsReconnectTimer) {
-        wsReconnectTimer = setTimeout(() => {
-          wsReconnectTimer = null;
-          startBinanceWebSocket();
-        }, 3000);
-      }
-    });
-
-    ws.addEventListener('error', () => {
-      try {
-        ws.close();
-      } catch {
-        // Ignore
-      }
-    });
-  } catch {
-    // REST polling fallback continues cleanly
-  }
-}
-
-async function startServer() {
+export function createQuantServerApp(options?: { dbPath?: string; startMarketFeeds?: boolean }) {
+  const feedsEnabled = options?.startMarketFeeds !== false;
   const app = express();
-  app.use(express.json());
+  const repo = new QuantRepository(options?.dbPath);
+  const marketHub = new MarketDataHub();
+  const executor = new ExchangeExecutionService(repo);
+  const savedConfig = repo.getConfig();
+  marketHub.setVenue(savedConfig.marketVenue);
 
-  app.get('/api/health', (_req, res) => {
-    res.json({
-      ok: true,
-      source: liveState?.source ?? 'quant_engine_sim',
-      updatedAt: liveState?.updatedAt ?? Date.now(),
+  app.use(express.json({ limit: '512kb' }));
+  app.use((_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    next();
+  });
+
+  const postLimiter = createRateLimiter(30, 60_000);
+  const aiLimiter = createRateLimiter(12, 60_000);
+
+  // Health & Readiness Endpoint with Real Dependency Checks
+  app.get('/api/health', (req, res) => {
+    const activeVenue = marketHub.getVenue();
+    const snap = marketHub.getSnapshot(activeVenue);
+    const venueHealth = snap?.health ?? marketHub.getAllHealth()[activeVenue];
+    const dbOk = repo.ping();
+    const acc = repo.getAccountState();
+    const reconcile = executor.getPaperReconciliation();
+
+    const dependencies: Record<string, HealthDependencyEntry> = {
+      apiServer: { status: 'HEALTHY', detail: 'Express API đang phản hồi' },
+      database: dbOk
+        ? { status: 'HEALTHY', detail: 'SQLite WAL sẵn sàng' }
+        : { status: 'DOWN', detail: 'Lỗi kết nối SQLite' },
+      marketDataRest: !feedsEnabled
+        ? { status: 'STANDBY', detail: 'Tắt feed nền (Chế độ kiểm thử)' }
+        : snap && snap.candles.length >= 30
+          ? { status: 'HEALTHY', detail: `${snap.candles.length} nến · Nguồn ${snap.source}` }
+          : { status: 'DEGRADED', detail: 'Đang đồng bộ nến REST từ sàn' },
+      marketDataWs: !feedsEnabled
+        ? { status: 'STANDBY', detail: 'Tắt WS nền (Chế độ kiểm thử)' }
+        : venueHealth.wsConnected
+          ? { status: 'HEALTHY', detail: `WS Open · Seq #${venueHealth.sequenceNumber}` }
+          : { status: 'DEGRADED', detail: `WS chưa mở (Reconnects: ${venueHealth.reconnectCount})` },
+      orderbookFeed: !feedsEnabled
+        ? { status: 'STANDBY', detail: 'Orderbook standby' }
+        : snap?.orderbookSource === 'EXCHANGE_DEPTH'
+          ? { status: 'HEALTHY', detail: `Top-20 Depth sẵn sàng (${snap.orderbookImbalance})` }
+          : { status: 'DEGRADED', detail: 'Chưa nhận được sổ lệnh Depth20' },
+      fundingFeed:
+        activeVenue === 'BINANCE_SPOT'
+          ? { status: 'STANDBY', detail: 'Spot 1x không dùng Funding' }
+          : snap?.fundingRate !== null && snap?.fundingRate !== undefined
+            ? { status: 'HEALTHY', detail: `Funding ${(snap.fundingRate * 100).toFixed(4)}%` }
+            : { status: feedsEnabled ? 'DEGRADED' : 'STANDBY', detail: 'Chờ dữ liệu MarkPrice/Funding' },
+      agentEngine: { status: 'HEALTHY', detail: 'Hội đồng 6 Agent & Phản biện sẵn sàng' },
+      riskEngine: acc.emergencyStopActive
+        ? { status: 'DEGRADED', detail: 'Kill Switch đang khóa mở lệnh mới' }
+        : { status: 'HEALTHY', detail: 'Khiên VETO & Circuit Breakers đang hoạt động' },
+      paperTradingEngine: reconcile.consistent
+        ? { status: 'HEALTHY', detail: `Sổ cái cân bằng ($${reconcile.equityUsd.toLocaleString('en-US')})` }
+        : { status: 'DEGRADED', detail: `Chênh lệch đối soát $${reconcile.discrepancyUsd.toFixed(2)}` },
+      executionEngine: { status: 'HEALTHY', detail: 'Adapter Simulation / Paper / Testnet / Locked Live sẵn sàng' },
+    };
+
+    const feedReady = !feedsEnabled || (venueHealth.status === 'HEALTHY' && (snap?.candles.length ?? 0) >= 30);
+    const overallOk = dbOk && feedReady;
+    const overallStatus = !dbOk ? 'DOWN' : overallOk ? 'HEALTHY' : 'DEGRADED';
+
+    const statusCode = !dbOk || (req.query.strict === '1' && !overallOk) ? 503 : 200;
+
+    res.status(statusCode).json({
+      ok: overallOk,
+      status: overallStatus,
+      venue: activeVenue,
+      source: snap?.source ?? 'quant_engine_sim',
+      health: venueHealth,
+      allVenues: marketHub.getAllHealth(),
+      dependencies,
+      credentials: getExchangeCredentialsStatus(),
+      updatedAt: snap?.updatedAt ?? Date.now(),
     });
   });
 
-  app.get('/api/btc-market', async (_req, res) => {
-    if (!liveState || Date.now() - liveState.updatedAt > 6000) {
+  // Live Spot or Futures Market Snapshot
+  app.get('/api/btc-market', async (req, res) => {
+    const requestedVenue = String(req.query.venue || marketHub.getVenue()) as MarketVenue;
+    const venue: MarketVenue = VALID_VENUES.has(requestedVenue)
+      ? requestedVenue
+      : marketHub.getVenue();
+
+    if (venue !== marketHub.getVenue()) {
+      marketHub.setVenue(venue);
+      if (feedsEnabled) marketHub.startWebSocket(venue);
+    }
+
+    const current = marketHub.getSnapshot(venue);
+    if (feedsEnabled && (!current || Date.now() - current.updatedAt > 6000)) {
       await Promise.race([
-        refreshRestSnapshot().catch(() => null),
+        marketHub.refreshRestSnapshot(venue).catch(() => null),
         new Promise((resolve) => setTimeout(resolve, 2500)),
       ]);
     }
-    if (liveState && liveState.candles.length > 0) {
-      res.json(liveState);
+
+    const snap = marketHub.getSnapshot(venue);
+    if (snap && snap.candles.length > 0) {
+      executor.matchOpenPaperOrders(snap.price);
+      res.json(snap);
       return;
     }
+
+    const emptyHealth = marketHub.getAllHealth()[venue];
     res.json({
+      venue,
       source: 'quant_engine_sim',
+      metadata: {
+        symbol: 'BTCUSDT',
+        market_type: venue === 'BINANCE_FUTURES' ? 'FUTURES' : 'SPOT',
+        timeframe: '15m',
+        exchange_timestamp: Date.now(),
+        received_timestamp: Date.now(),
+        sequence_number: emptyHealth.sequenceNumber,
+        data_status: 'UNAVAILABLE',
+        quality_flags: ['NO_MARKET_FEED'],
+      },
+      health: emptyHealth,
+      orderbookSource: 'UNAVAILABLE',
+      aggTradeCvdDelta: null,
       candles: [],
+      updatedAt: Date.now(),
     });
   });
 
-  // Real-time Server-Sent Events stream for live BTC/USDT ticks
+  // Real Historical BTC Klines Loader for Mode B Historical Backtest
+  app.get('/api/historical-klines', async (req, res) => {
+    const reqVenue = String(req.query.venue || 'BINANCE_SPOT') as MarketVenue;
+    const venue: MarketVenue = VALID_VENUES.has(reqVenue) ? reqVenue : 'BINANCE_SPOT';
+    const reqInterval = String(req.query.interval || '15m') as TimeframeKey;
+    const interval: TimeframeKey = VALID_INTERVALS.has(reqInterval) ? reqInterval : '15m';
+    const limit = Math.max(100, Math.min(1000, Number(req.query.limit) || 1000));
+
+    try {
+      const data = await marketHub.fetchHistoricalKlines({ venue, interval, limit });
+      repo.log(
+        'INFO',
+        'BACKTEST_DATA',
+        `Fetched ${data.candles.length} historical ${interval} candles from ${venue}`,
+      );
+      res.json({ ok: true, venue, interval, ...data });
+    } catch (err) {
+      res.status(502).json({
+        ok: false,
+        error: err instanceof Error ? err.message : 'Failed to load historical BTC klines',
+      });
+    }
+  });
+
+  // Real-time Server-Sent Events Stream (with max client limit)
+  const MAX_SSE_CLIENTS = 50;
+  const sseClients = new Set<express.Response>();
+  let lastBroadcastAt = 0;
+
+  const pushSseSnapshot = (snap: ReturnType<MarketDataHub['getSnapshot']>, force = false) => {
+    if (!snap || sseClients.size === 0) return;
+    const now = Date.now();
+    if (!force && now - lastBroadcastAt < 450) return;
+    lastBroadcastAt = now;
+
+    const payload = `data: ${JSON.stringify({
+      venue: snap.venue,
+      source: snap.source,
+      metadata: snap.metadata,
+      health: snap.health,
+      price: snap.price,
+      change24hPct: snap.change24hPct,
+      high24h: snap.high24h,
+      low24h: snap.low24h,
+      volume24hUsd: snap.volume24hUsd,
+      bestBid: snap.bestBid,
+      bestAsk: snap.bestAsk,
+      orderbookImbalance: snap.orderbookImbalance,
+      orderbookSource: snap.orderbookSource ?? 'UNAVAILABLE',
+      orderbookBids: snap.orderbookBids,
+      orderbookAsks: snap.orderbookAsks,
+      aggTradeCvdDelta: snap.aggTradeCvdDelta ?? null,
+      fundingRate: snap.fundingRate,
+      futuresMetrics: snap.futuresMetrics,
+      htfContext: snap.htfContext,
+      updatedAt: snap.updatedAt,
+      latestCandle: snap.candles[snap.candles.length - 1] ?? null,
+    })}\n\n`;
+
+    for (const client of sseClients) {
+      try {
+        client.write(payload);
+      } catch {
+        sseClients.delete(client);
+      }
+    }
+  };
+
+  marketHub.subscribe((snap, force) => {
+    if (snap.price > 0) {
+      executor.matchOpenPaperOrders(snap.price);
+    }
+    pushSseSnapshot(snap, force);
+  });
+
   app.get('/api/btc-stream', (req, res) => {
+    if (sseClients.size >= MAX_SSE_CLIENTS) {
+      res.status(503).json({ ok: false, error: 'Quá giới hạn kết nối SSE đồng thời.' });
+      return;
+    }
+
+    const reqVenue = String(req.query.venue || marketHub.getVenue()) as MarketVenue;
+    if (VALID_VENUES.has(reqVenue) && reqVenue !== marketHub.getVenue()) {
+      marketHub.setVenue(reqVenue);
+      if (feedsEnabled) {
+        marketHub.startWebSocket(reqVenue);
+        void marketHub.refreshRestSnapshot(reqVenue);
+      }
+    }
+
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
     res.flushHeaders?.();
 
     sseClients.add(res);
-    broadcastTick(true);
+    const snap = marketHub.getSnapshot(marketHub.getVenue());
+    if (snap) pushSseSnapshot(snap, true);
 
     const heartbeat = setInterval(() => {
       try {
@@ -542,6 +362,219 @@ async function startServer() {
     });
   });
 
+  // Persisted State & Audit Endpoints
+  app.get('/api/state', (_req, res) => {
+    res.json({
+      ok: true,
+      ...repo.getFullSnapshot(),
+      reconciliation: executor.getPaperReconciliation(),
+      credentials: getExchangeCredentialsStatus(),
+      systemLogs: repo.getSystemLogs(40),
+    });
+  });
+
+  app.put('/api/config', postLimiter, (req, res) => {
+    const current = repo.getConfig();
+    const sanitized = sanitizeConfigInput(req.body, current);
+    repo.saveConfig(sanitized);
+    if (sanitized.marketVenue !== marketHub.getVenue()) {
+      marketHub.setVenue(sanitized.marketVenue);
+      if (feedsEnabled) {
+        marketHub.startWebSocket(sanitized.marketVenue);
+        void marketHub.refreshRestSnapshot(sanitized.marketVenue);
+      }
+    }
+    repo.log(
+      'INFO',
+      'CONFIG',
+      `Updated strategy config (venue=${sanitized.marketVenue}, mode=${sanitized.executionMode}, sizing=${sanitized.sizingMethod} ${sanitized.riskPerTradePct}%)`,
+    );
+    res.json({ ok: true, config: sanitized });
+  });
+
+  app.post('/api/state/sync', postLimiter, (req, res) => {
+    const body = req.body as {
+      accountState?: RiskAccountState;
+      activePosition?: Position | null;
+      newTrade?: ClosedTrade | null;
+      riskEvent?: RiskEventRecord | null;
+    };
+    if (!body || typeof body !== 'object') {
+      res.status(400).json({ ok: false, error: 'Payload đồng bộ không hợp lệ.' });
+      return;
+    }
+    if (body.accountState && Number.isFinite(body.accountState.equity)) {
+      repo.saveAccountState(body.accountState);
+    }
+    if (body.activePosition !== undefined) {
+      repo.saveActivePosition(body.activePosition);
+    }
+    if (body.newTrade && body.newTrade.id) {
+      repo.upsertTrade(body.newTrade);
+    }
+    if (body.riskEvent && body.riskEvent.id) {
+      repo.addRiskEvent(body.riskEvent);
+    }
+    res.json({ ok: true });
+  });
+
+  app.post('/api/risk/emergency-stop', postLimiter, (req, res) => {
+    const active = Boolean((req.body as { active?: boolean })?.active ?? true);
+    const acc = repo.getAccountState();
+    const nextAcc: RiskAccountState = {
+      ...acc,
+      emergencyStopActive: active,
+    };
+    repo.saveAccountState(nextAcc);
+    repo.addRiskEvent({
+      id: `EV-KILL-${Date.now()}`,
+      eventType: 'EMERGENCY_STOP',
+      message: active
+        ? 'KÍCH HOẠT KILL SWITCH: Khóa toàn bộ lệnh mở mới (Auto & Manual).'
+        : 'ĐÃ GỠ KILL SWITCH: Cho phép hệ thống đánh giá lại điều kiện vào lệnh.',
+      createdAt: Date.now(),
+    });
+    repo.log('SECURITY', 'KILL_SWITCH', `Emergency stop set to ${active}`);
+    res.json({ ok: true, accountState: nextAcc });
+  });
+
+  app.post('/api/risk/reset', postLimiter, (req, res) => {
+    const initialCapital = Number((req.body as { initialCapital?: number })?.initialCapital);
+    const snapshot = repo.resetSession(
+      Number.isFinite(initialCapital) && initialCapital >= 1000 ? initialCapital : undefined,
+    );
+    res.json({ ok: true, ...snapshot });
+  });
+
+  // Staged Order Execution Adapter (Simulation / Paper / Testnet / Locked Live)
+  app.post('/api/execution/order', postLimiter, async (req, res) => {
+    const body = req.body as {
+      clientOrderId?: string;
+      mode?: ExecutionMode;
+      venue?: MarketVenue;
+      side?: 'BUY' | 'SELL';
+      positionSide?: 'LONG' | 'SHORT';
+      orderType?: 'MARKET' | 'LIMIT';
+      qtyBtc?: number;
+      referencePrice?: number;
+      limitPrice?: number;
+      expiresInMs?: number;
+      confirmLiveOverride?: boolean;
+    };
+
+    if (
+      !body ||
+      typeof body.clientOrderId !== 'string' ||
+      body.clientOrderId.length < 4 ||
+      (body.side !== 'BUY' && body.side !== 'SELL') ||
+      (body.positionSide !== 'LONG' && body.positionSide !== 'SHORT') ||
+      !Number.isFinite(Number(body.qtyBtc)) ||
+      Number(body.qtyBtc) <= 0 ||
+      !Number.isFinite(Number(body.referencePrice)) ||
+      Number(body.referencePrice) <= 0
+    ) {
+      res.status(400).json({ ok: false, error: 'Tham số đặt lệnh không hợp lệ.' });
+      return;
+    }
+
+    const cfg = repo.getConfig();
+    const mode: ExecutionMode = body.mode && VALID_MODES.has(body.mode) ? body.mode : cfg.executionMode;
+    const venue: MarketVenue =
+      body.venue && VALID_VENUES.has(body.venue) ? body.venue : cfg.marketVenue;
+
+    const record = await executor.executeOrder({
+      clientOrderId: body.clientOrderId,
+      mode,
+      venue,
+      side: body.side,
+      positionSide: body.positionSide,
+      orderType: body.orderType === 'LIMIT' ? 'LIMIT' : 'MARKET',
+      qtyBtc: Number(body.qtyBtc),
+      referencePrice: Number(body.referencePrice),
+      limitPrice:
+        body.limitPrice !== undefined && Number.isFinite(Number(body.limitPrice))
+          ? Number(body.limitPrice)
+          : undefined,
+      expiresInMs:
+        body.expiresInMs !== undefined && Number.isFinite(Number(body.expiresInMs))
+          ? Number(body.expiresInMs)
+          : undefined,
+      confirmLiveOverride: Boolean(body.confirmLiveOverride),
+    });
+
+    res.status(record.status === 'REJECTED' ? 422 : 200).json({
+      ok: record.status !== 'REJECTED',
+      order: record,
+      reconciliation: executor.getPaperReconciliation(),
+    });
+  });
+
+  app.post('/api/execution/cancel', postLimiter, (req, res) => {
+    const body = req.body as { clientOrderId?: string };
+    if (!body || typeof body.clientOrderId !== 'string' || body.clientOrderId.length < 4) {
+      res.status(400).json({ ok: false, error: 'clientOrderId không hợp lệ.' });
+      return;
+    }
+    const result = executor.cancelOrder(body.clientOrderId);
+    res.status(result.ok ? 200 : 400).json({
+      ...result,
+      reconciliation: executor.getPaperReconciliation(),
+    });
+  });
+
+  app.get('/api/execution/reconcile', (req, res) => {
+    const matchPrice = Number(req.query.price);
+    if (Number.isFinite(matchPrice) && matchPrice > 0) {
+      executor.matchOpenPaperOrders(matchPrice);
+    }
+    res.json({
+      ok: true,
+      reconciliation: executor.getPaperReconciliation(),
+      orders: repo.getOrders(50),
+    });
+  });
+
+  // Optional Server-Side Gemini AI Quantitative Advisory (Never bypasses Risk Guardian)
+  app.post('/api/ai/analyze', aiLimiter, async (req, res) => {
+    const body = req.body as {
+      price?: number;
+      venue?: MarketVenue;
+      regime?: StrategyConfig['marketVenue'] | string;
+      indicators?: Parameters<typeof generateGeminiQuantAdvisory>[0]['indicators'];
+      councilDirection?: 'LONG' | 'SHORT' | 'NEUTRAL';
+      councilScore?: number;
+    };
+
+    if (
+      !body ||
+      !Number.isFinite(Number(body.price)) ||
+      Number(body.price) <= 0 ||
+      !body.indicators
+    ) {
+      res.status(400).json({ ok: false, error: 'Thiếu dữ liệu chỉ báo hợp lệ để phân tích AI.' });
+      return;
+    }
+
+    const result = await generateGeminiQuantAdvisory({
+      price: Number(body.price),
+      venue: body.venue && VALID_VENUES.has(body.venue) ? body.venue : DEFAULT_STRATEGY_CONFIG.marketVenue,
+      regime: (body.regime as Parameters<typeof generateGeminiQuantAdvisory>[0]['regime']) ?? 'Tích lũy Nén Biến động',
+      indicators: body.indicators,
+      councilDirection:
+        body.councilDirection === 'LONG' || body.councilDirection === 'SHORT'
+          ? body.councilDirection
+          : 'NEUTRAL',
+      councilScore: Number.isFinite(Number(body.councilScore)) ? Number(body.councilScore) : 50,
+    });
+    res.json({ ok: true, advisory: result });
+  });
+
+  return { app, repo, marketHub };
+}
+
+async function startServer() {
+  const { app, marketHub, repo } = createQuantServerApp({ startMarketFeeds: true });
+
   if (process.env.NODE_ENV === 'production') {
     const distDir = path.resolve(__dirname, 'dist');
     app.use(express.static(distDir));
@@ -557,35 +590,41 @@ async function startServer() {
     app.use(vite.middlewares);
   }
 
-  // Bind port immediately so startup/health probes pass without waiting on external market APIs
-  app.listen(PORT, '0.0.0.0', () => {
+  const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`AegisBTC Quant server listening on http://0.0.0.0:${PORT}`);
 
-    void refreshRestSnapshot().finally(() => {
-      startBinanceWebSocket();
+    // Warm both Spot & Futures non-blocking after binding port 3000
+    const initVenue = marketHub.getVenue();
+    void marketHub.refreshRestSnapshot(initVenue).finally(() => {
+      marketHub.startWebSocket(initVenue);
     });
 
-    // Keep REST funding & fallback refreshed periodically
-    restPollTimer = setInterval(async () => {
-      const wsHealthy = wsConn && wsConn.readyState === WebSocket.OPEN;
-      if (!wsHealthy) {
-        await refreshRestSnapshot();
-      } else {
-        try {
-          const f = await fetchJsonWithTimeout<{ lastFundingRate?: string }>(
-            'https://fapi.binance.com/fapi/v1/premiumIndex?symbol=BTCUSDT',
-            2500,
-          );
-          if (liveState && f.lastFundingRate) {
-            liveState.fundingRate = Number(f.lastFundingRate);
-          }
-        } catch {
-          // Ignore optional funding poll failure
-        }
+    const restPollTimer = setInterval(async () => {
+      const v = marketHub.getVenue();
+      const health = marketHub.getAllHealth()[v];
+      if (!health.wsConnected) {
+        await marketHub.refreshRestSnapshot(v);
+      } else if (v === 'BINANCE_FUTURES') {
+        // Refresh Open Interest + HTF context periodically even when WS is up
+        await marketHub.refreshRestSnapshot(v);
       }
-    }, 4000);
-    void restPollTimer;
+    }, 10000);
+
+    const shutdown = () => {
+      clearInterval(restPollTimer);
+      marketHub.stop();
+      repo.close();
+      server.close(() => process.exit(0));
+    };
+    process.once('SIGTERM', shutdown);
+    process.once('SIGINT', shutdown);
   });
 }
 
-startServer();
+// Start server only when executed as entrypoint
+const isEntrypoint =
+  process.argv[1] &&
+  path.resolve(process.argv[1]) === path.resolve(__filename);
+if (isEntrypoint) {
+  void startServer();
+}

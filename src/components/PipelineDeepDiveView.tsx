@@ -1,10 +1,18 @@
 import { ArrowRight, CheckCircle2, ShieldAlert } from 'lucide-react';
-import type { AgentId, PipelineCycle, TechnicalIndicators } from '../engine/types';
+import type {
+  AgentId,
+  FeedHealthTelemetry,
+  PipelineCycle,
+  RiskEventRecord,
+  TechnicalIndicators,
+} from '../engine/types';
 
 interface PipelineDeepDiveViewProps {
   cycle: PipelineCycle | null;
   indicators: TechnicalIndicators;
   cycleHistory: PipelineCycle[];
+  riskEvents: RiskEventRecord[];
+  healthTelemetry: FeedHealthTelemetry | null;
   onTriggerScan: () => void;
 }
 
@@ -12,6 +20,7 @@ const AGENT_VI_NAMES: Record<AgentId | 'PROPOSED_TRADE', string> = {
   macro_scout: 'Trinh sát Vĩ mô',
   quant_analyst: 'Chuyên gia Định lượng',
   orderflow_radar: 'Radar Sổ lệnh',
+  strategy_architect: 'Kiến trúc Chiến lược',
   risk_guardian: 'Giám đốc Rủi ro',
   execution_commander: 'Chỉ huy Khớp lệnh',
   PROPOSED_TRADE: 'Đề xuất Lệnh',
@@ -21,37 +30,44 @@ const ARCHITECTURE_STEPS = [
   {
     code: '01. Bước A',
     agentKey: 'macro_scout' as const,
-    title: 'Thu thập Vĩ mô & Phân loại Đa khung M15–H4',
+    title: 'Thu thập Vĩ mô & Đa khung M5–D1',
     detail:
-      'Quét 200 nến M15 cùng bối cảnh H1/H4, Spot CVD, Funding Rate và EMA200 để phân loại chế độ thị trường và chống đánh ngược dòng chính.',
+      'Quét 200 nến M15 cùng klines thực đã đóng từ sàn (M5, H1, H4, D1), OBV slope, AggTrade CVD, Funding Futures (khi chọn Futures) và EMA200.',
   },
   {
     code: '02. Bước B',
     agentKey: 'quant_analyst' as const,
-    title: 'Hội tụ Đa Chỉ báo & Cấu trúc Sóng BoS',
+    title: 'Hội tụ Đa Chỉ báo & Cấu trúc BOS/CHoCH',
     detail:
-      'Xác nhận hội tụ EMA9/21/50, RSI(14), MACD, VWAP và cấu trúc đỉnh/đáy 16 nến, đồng thời kiểm tra độ giãn cách ATR tránh FOMO.',
+      'Xác nhận hội tụ SMA/EMA chuẩn hóa, RSI(14), Wilder ADX(14), MACD(12,26,9), Bollinger Bands, VWAP, vùng giá POC/VAH/VAL và cấu trúc BOS/CHoCH.',
   },
   {
     code: '03. Bước C',
     agentKey: 'orderflow_radar' as const,
-    title: 'Quét Sổ lệnh Thời gian thực & Bẫy Thanh khoản',
+    title: 'Quét Sổ lệnh Depth20 & Thanh khoản',
     detail:
-      'Phát hiện Liquidity Sweep, mất cân bằng Bid/Ask chiều sâu 20 bước và chuẩn hóa khối lượng theo thời gian nến M15 thực tế.',
+      'Đo chênh lệch Bid/Ask thực (trả UNAVAILABLE nếu mất sổ lệnh, tuyệt đối không giả lập bằng EMA), Spread bps, Z-Score khối lượng và Sweep.',
   },
   {
     code: '04. Bước D',
-    agentKey: 'risk_guardian' as const,
-    title: 'Phản biện Chéo & Trọng tài VETO (Half-Kelly)',
+    agentKey: 'strategy_architect' as const,
+    title: 'Kiến trúc Chiến lược & Thiết kế Playbook R:R',
     detail:
-      'Tổng hợp phản biện từ 3 tác tử phân tích, hiệu chỉnh điểm tin cậy và tính R:R ròng sau phí giao dịch 2 chiều trước khi cấp phép.',
+      'Chọn Playbook phù hợp chế độ thị trường (Trend / Breakout / Sweep Reversal), kiểm tra khoảng thoáng Pivot S/R và định vị Entry/SL/TP.',
   },
   {
     code: '05. Bước E',
-    agentKey: 'execution_commander' as const,
-    title: 'Khớp lệnh Thông minh & Dời Stop Hòa vốn',
+    agentKey: 'risk_guardian' as const,
+    title: 'Phản biện Chéo & Trọng tài Rủi ro Định chế',
     detail:
-      'Thực thi lệnh tối ưu. Khi chạm TP1 chốt 50% và dời Stop về hòa vốn; tự động siết SL nếu xuất hiện phản biện đảo chiều mạnh >= 80đ.',
+      'Áp dụng cho cả lệnh Auto và Manual: kiểm tra lỗ ngày/tuần, max drawdown, chuỗi thua, spread, ký quỹ khả dụng, giá thanh lý và R:R ròng.',
+  },
+  {
+    code: '06. Bước F',
+    agentKey: 'execution_commander' as const,
+    title: 'Thực thi Phân tầng & Dời Stop Hòa vốn',
+    detail:
+      'Hỗ trợ Market/Limit trên Simulation / Paper / Binance Testnet (Live bị khóa mặc định). Khi chạm TP1 chốt 50% và kéo SL về hòa vốn.',
   },
 ];
 
@@ -59,21 +75,22 @@ export function PipelineDeepDiveView({
   cycle,
   indicators,
   cycleHistory,
+  riskEvents,
+  healthTelemetry,
   onTriggerScan,
 }: PipelineDeepDiveViewProps) {
   return (
     <div className="max-w-6xl mx-auto px-6 py-8 space-y-10">
-      {/* Header */}
       <div className="flex flex-col md:flex-row md:items-end justify-between gap-4 border-b border-white/10 pb-6">
         <div>
           <p className="text-xs font-medium text-amber-400 mb-1">
-            Kiến trúc Đa Tác tử Phản biện Định lượng
+            Kiến trúc Đa Tác tử Phản biện Định lượng V2
           </p>
           <h1 className="font-display text-2xl md:text-3xl font-bold text-slate-50">
-            Quy trình Giao dịch Bitcoin Tự động từ A đến Z
+            Quy trình Giao dịch Bitcoin từ A đến Z
           </h1>
           <p className="text-sm text-slate-400 mt-2 max-w-2xl">
-            Mỗi quyết định vào lệnh phải vượt qua 5 lớp kiểm duyệt và vòng phản biện đối kháng trực tiếp giữa Macro, Quant và Orderflow trước khi Risk Guardian duyệt lệnh.
+            Mỗi đề xuất (tự động hoặc thủ công) đều phải vượt qua 6 lớp kiểm duyệt, vòng phản biện đối kháng và cổng chặn Risk Guardian trước khi ghi nhận lệnh.
           </p>
         </div>
         <button
@@ -85,26 +102,25 @@ export function PipelineDeepDiveView({
         </button>
       </div>
 
-      {/* Live Snapshot Strip */}
+      {/* Live Quant Telemetry Matrix */}
       <div className="py-4 border-b border-white/10 space-y-4">
         <div className="grid grid-cols-2 md:grid-cols-5 gap-6">
           <div>
-            <span className="text-xs text-slate-400 block">Trạng thái Thị trường</span>
+            <span className="text-xs text-slate-400 block">Chế độ Thị trường</span>
             <span className="text-sm font-semibold text-slate-100 mt-1 block">
-              {cycle?.regime ?? 'Đang quét'}
+              {cycle?.regime ?? 'Đang quét'} ({cycle?.regimeConfidence ?? 0}%)
             </span>
           </div>
           <div>
-            <span className="text-xs text-slate-400 block">RSI(14) / ATR(14)</span>
+            <span className="text-xs text-slate-400 block">RSI(14) / Wilder ADX(14)</span>
             <span className="text-sm font-mono font-semibold text-slate-100 tabular-nums mt-1 block">
-              {indicators.rsi14.toFixed(1)} · ${indicators.atr14.toFixed(0)}
+              {indicators.rsi14.toFixed(1)} · {indicators.adx14.toFixed(1)}
             </span>
           </div>
           <div>
-            <span className="text-xs text-slate-400 block">Spot CVD / Orderbook</span>
+            <span className="text-xs text-slate-400 block">Volume Profile (POC / VAL–VAH)</span>
             <span className="text-sm font-mono font-semibold text-slate-100 tabular-nums mt-1 block">
-              {indicators.spotCvdDelta >= 0 ? '+' : ''}${indicators.spotCvdDelta.toFixed(1)}M ·{' '}
-              {Math.round(indicators.orderbookImbalance * 100)}%
+              ${indicators.volumeProfile.poc.toLocaleString('en-US', { maximumFractionDigits: 0 })}
             </span>
           </div>
           <div>
@@ -114,20 +130,19 @@ export function PipelineDeepDiveView({
             </span>
           </div>
           <div>
-            <span className="text-xs text-slate-400 block">Quyết định Cuối</span>
+            <span className="text-xs text-slate-400 block">Trạng thái Dữ liệu</span>
             <span className="text-sm font-mono font-semibold text-slate-100 mt-1 block">
-              {cycle?.actionTaken ?? 'NO_SETUP'}
+              {healthTelemetry?.status ?? cycle?.dataQuality ?? 'HEALTHY'}
             </span>
           </div>
         </div>
 
-        {/* Secondary Quant Telemetry Matrix */}
         <div className="pt-3 border-t border-white/8 grid grid-cols-2 md:grid-cols-6 gap-4 text-xs font-mono tabular-nums">
           <div>
-            <span className="text-slate-500 font-sans block">EMA9 / EMA21</span>
+            <span className="text-slate-500 font-sans block">SMA20 / SMA50</span>
             <span className="text-slate-200">
-              ${indicators.ema9.toLocaleString('en-US', { maximumFractionDigits: 0 })} / $
-              {indicators.ema21.toLocaleString('en-US', { maximumFractionDigits: 0 })}
+              ${indicators.sma20.toLocaleString('en-US', { maximumFractionDigits: 0 })} / $
+              {indicators.sma50.toLocaleString('en-US', { maximumFractionDigits: 0 })}
             </span>
           </div>
           <div>
@@ -138,40 +153,80 @@ export function PipelineDeepDiveView({
             </span>
           </div>
           <div>
-            <span className="text-slate-500 font-sans block">HTF H1 / H4</span>
-            <span
-              className={
-                indicators.htfBias === 'LONG'
-                  ? 'text-emerald-400'
-                  : indicators.htfBias === 'SHORT'
-                    ? 'text-rose-400'
-                    : 'text-slate-300'
-              }
-            >
-              {indicators.h1Bias} / {indicators.h4Bias}
+            <span className="text-slate-500 font-sans block">
+              Đa khung ({indicators.htfSource === 'EXCHANGE_KLINES' ? 'Sàn thực' : indicators.htfSource})
+            </span>
+            <span className="text-sky-400">
+              M5:{indicators.m5Bias} H1:{indicators.h1Bias} H4:{indicators.h4Bias} D1:{indicators.d1Bias}
             </span>
           </div>
           <div>
-            <span className="text-slate-500 font-sans block">Cấu trúc / VWAP</span>
-            <span className="text-sky-400">
-              {indicators.structureBias} · $
+            <span className="text-slate-500 font-sans block">Hỗ trợ / Kháng cự</span>
+            <span className="text-slate-200">
+              ${indicators.srLevels.nearestSupport.toLocaleString('en-US', { maximumFractionDigits: 0 })} / $
+              {indicators.srLevels.nearestResistance.toLocaleString('en-US', { maximumFractionDigits: 0 })}
+            </span>
+          </div>
+          <div>
+            <span className="text-slate-500 font-sans block">OBV Slope / Vol Z</span>
+            <span className={indicators.obvSlope >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
+              {indicators.obvSlope >= 0 ? '+' : ''}
+              {indicators.obvSlope.toFixed(1)} · Z={indicators.volumeZScore.toFixed(1)}
+            </span>
+          </div>
+          <div>
+            <span className="text-slate-500 font-sans block">Funding / Spread</span>
+            <span className="text-slate-200">
+              {indicators.fundingRate !== null
+                ? `${(indicators.fundingRate * 100).toFixed(4)}%`
+                : 'Spot N/A'}{' '}
+              · {indicators.spreadBps.toFixed(1)}bps
+            </span>
+          </div>
+        </div>
+
+        {/* V2 Extended Indicator & Data Integrity Telemetry */}
+        <div className="pt-3 border-t border-white/8 grid grid-cols-2 md:grid-cols-6 gap-4 text-xs font-mono tabular-nums">
+          <div>
+            <span className="text-slate-500 font-sans block">MACD / Signal</span>
+            <span className={indicators.macdHistogram >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
+              {indicators.macdLine.toFixed(1)} / {indicators.macdSignal.toFixed(1)}
+            </span>
+          </div>
+          <div>
+            <span className="text-slate-500 font-sans block">BB Width / VWAP24</span>
+            <span className="text-slate-200">
+              {(indicators.bbBandwidth * 100).toFixed(2)}% · $
               {indicators.vwap24.toLocaleString('en-US', { maximumFractionDigits: 0 })}
             </span>
           </div>
           <div>
-            <span className="text-slate-500 font-sans block">ADX / BB Width</span>
-            <span className="text-slate-200">
-              {indicators.adxProxy.toFixed(1)} · {(indicators.bbBandwidth * 100).toFixed(2)}%
+            <span className="text-slate-500 font-sans block">Cấu trúc Sóng</span>
+            <span className="text-amber-300">{indicators.structureEvent}</span>
+          </div>
+          <div>
+            <span className="text-slate-500 font-sans block">Orderbook Source</span>
+            <span className={indicators.orderbookSource === 'EXCHANGE_DEPTH' ? 'text-emerald-400' : 'text-slate-400'}>
+              {indicators.orderbookSource}
             </span>
           </div>
           <div>
-            <span className="text-slate-500 font-sans block">Funding Rate</span>
-            <span className={indicators.fundingRate >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
-              {indicators.fundingRate >= 0 ? '+' : ''}
-              {(indicators.fundingRate * 100).toFixed(4)}%
+            <span className="text-slate-500 font-sans block">CVD ({indicators.cvdSource})</span>
+            <span className={indicators.spotCvdDelta >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
+              {indicators.spotCvdDelta >= 0 ? '+' : ''}${indicators.spotCvdDelta.toFixed(2)}M
             </span>
           </div>
+          <div>
+            <span className="text-slate-500 font-sans block">Phân loại Dữ liệu</span>
+            <span className="text-sky-300">{indicators.dataStatus}</span>
+          </div>
         </div>
+
+        {cycle?.risk.confidenceDisclaimer && (
+          <p className="text-[11px] text-slate-400 italic pt-1">
+            Lưu ý định lượng: {cycle.risk.confidenceDisclaimer}
+          </p>
+        )}
       </div>
 
       {/* Multi-Agent Cross-Examination Transcript */}
@@ -291,12 +346,20 @@ export function PipelineDeepDiveView({
                         ? 'text-emerald-400'
                         : sig?.direction === 'SHORT' || isVeto
                           ? 'text-rose-400'
-                          : 'text-slate-300'
+                          : sig?.direction === 'UNAVAILABLE'
+                            ? 'text-amber-400'
+                            : 'text-slate-300'
                     }
                   >
-                    {sig?.direction ?? 'NEUTRAL'} · {sig?.confidence ?? 50}%
+                    {sig?.direction ?? 'NEUTRAL'} · {sig?.confidence ?? 0}%
                   </span>
                 </div>
+                {sig && (
+                  <span className="text-[11px] font-mono text-slate-500 tabular-nums">
+                    {sig.dataQuality} · {sig.latencyMs}ms
+                    {sig.riskFlags.length > 0 ? ` · ${sig.riskFlags[0]}` : ''}
+                  </span>
+                )}
                 {idx < ARCHITECTURE_STEPS.length - 1 && (
                   <span className="hidden lg:inline-flex items-center gap-1 text-[11px] text-slate-500">
                     <span>Chuyển tiếp</span>
@@ -308,6 +371,30 @@ export function PipelineDeepDiveView({
           );
         })}
       </div>
+
+      {/* Risk Events Log */}
+      {riskEvents.length > 0 && (
+        <div className="space-y-3">
+          <h2 className="font-display text-lg font-semibold text-slate-100">
+            Sự kiện Kiểm soát Rủi ro &amp; VETO (Persisted)
+          </h2>
+          <div className="border border-white/10 rounded-xl bg-[#0C121E] divide-y divide-white/8 text-xs">
+            {riskEvents.slice(0, 12).map((ev) => (
+              <div key={ev.id} className="px-4 py-2.5 flex items-center justify-between gap-4">
+                <div className="flex items-center gap-3">
+                  <span className="font-mono text-rose-400 font-semibold whitespace-nowrap">
+                    {ev.eventType}
+                  </span>
+                  <span className="text-slate-300">{ev.message}</span>
+                </div>
+                <span className="font-mono text-slate-500 whitespace-nowrap tabular-nums">
+                  {new Date(ev.createdAt).toLocaleTimeString('vi-VN')}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Recent Decision Audit Log */}
       <div className="space-y-3">

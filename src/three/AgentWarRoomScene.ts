@@ -20,6 +20,7 @@ const AGENT_ORDER: AgentId[] = [
   'macro_scout',
   'quant_analyst',
   'orderflow_radar',
+  'strategy_architect',
   'risk_guardian',
   'execution_commander',
 ];
@@ -28,6 +29,7 @@ const AGENT_COLORS: Record<AgentId, number> = {
   macro_scout: 0x38bdf8,
   quant_analyst: 0x818cf8,
   orderflow_radar: 0x2dd4bf,
+  strategy_architect: 0xa78bfa,
   risk_guardian: 0xf59e0b,
   execution_commander: 0x10b981,
 };
@@ -36,6 +38,7 @@ const STAGE_ACTIVE_AGENT: Record<PipelineStage, AgentId> = {
   INGEST_MARKET: 'macro_scout',
   QUANT_CONFLUENCE: 'quant_analyst',
   ORDERFLOW_SCAN: 'orderflow_radar',
+  STRATEGY_SYNTHESIS: 'strategy_architect',
   RISK_VETO_GATE: 'risk_guardian',
   EXECUTION_SYNC: 'execution_commander',
 };
@@ -102,9 +105,9 @@ function createFloorTelemetryTexture(maxAnisotropy: number): THREE.CanvasTexture
     ctx.stroke();
   }
 
-  // Pentagon axis lines to 5 stations
-  for (let i = 0; i < 5; i++) {
-    const angle = (i / 5) * Math.PI * 2 - Math.PI / 2;
+  // Hexagonal radial axis lines to 6 stations
+  for (let i = 0; i < 6; i++) {
+    const angle = (i / 6) * Math.PI * 2 - Math.PI / 2;
     ctx.beginPath();
     ctx.moveTo(cx + Math.cos(angle) * 125, cy + Math.sin(angle) * 125);
     ctx.lineTo(cx + Math.cos(angle) * 420, cy + Math.sin(angle) * 420);
@@ -290,9 +293,10 @@ interface AgentRig {
 const AGENT_SHORT_LABELS: Record<AgentId, string> = {
   macro_scout: '01 · TRINH SÁT VĨ MÔ',
   quant_analyst: '02 · ĐỊNH LƯỢNG',
-  orderflow_radar: '03 · SỔ LỆNH CÁ VOI',
-  risk_guardian: '04 · KHIÊN RỦI RO',
-  execution_commander: '05 · KHỚP LỆNH',
+  orderflow_radar: '03 · SỔ LỆNH THANH KHOẢN',
+  strategy_architect: '04 · CHIẾN LƯỢC',
+  risk_guardian: '05 · KHIÊN RỦI RO',
+  execution_commander: '06 · KHỚP LỆNH',
 };
 
 function createAgentLabelTexture(label: string, accentHex: number): THREE.CanvasTexture {
@@ -413,6 +417,7 @@ export class AgentWarRoomScene {
     this.renderer = new THREE.WebGLRenderer({
       antialias: !this.isSoftwareGl,
       powerPreference: 'high-performance',
+      preserveDrawingBuffer: this.isSoftwareGl,
     });
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -991,6 +996,33 @@ export class AgentWarRoomScene {
       sonarInner.rotation.y = Math.PI / 2;
       sonarInner.position.y = 0.06;
       headGroup.add(sonarInner);
+    } else if (agentId === 'strategy_architect') {
+      // Holographic blueprint prism core + twin geometric stabilizer wings
+      const leftWing = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.56, 0.42), brushedMetal);
+      leftWing.position.set(-0.48, 0.14, 0);
+      leftWing.rotation.z = -0.26;
+      headGroup.add(leftWing);
+
+      const rightWing = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.56, 0.42), brushedMetal);
+      rightWing.position.set(0.48, 0.14, 0);
+      rightWing.rotation.z = 0.26;
+      headGroup.add(rightWing);
+
+      const stratCore = new THREE.Mesh(
+        new THREE.IcosahedronGeometry(0.22, 0),
+        statusMaterial,
+      );
+      stratCore.position.set(0, 0.56, 0);
+      headGroup.add(stratCore);
+      accentMeshes.push(stratCore);
+
+      const orbitRing = new THREE.Mesh(
+        new THREE.TorusGeometry(0.36, 0.022, 8, 28),
+        brushedMetal,
+      );
+      orbitRing.rotation.x = Math.PI / 3;
+      orbitRing.position.set(0, 0.56, 0);
+      headGroup.add(orbitRing);
     } else if (agentId === 'risk_guardian') {
       // Twin armored shield pylons + floating octahedral shield crystal
       const leftPylon = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.85, 0.32), matteDark);
@@ -1079,11 +1111,12 @@ export class AgentWarRoomScene {
   }
 
   private buildConduitsAndPulses(): void {
-    // 1. Sequential pipeline conduits: Macro -> Quant -> Orderflow -> Risk -> Execution
+    // 1. Sequential pipeline conduits: Macro -> Quant -> Orderflow -> Strategy -> Risk -> Execution
     const links: Array<[AgentId | 'core', AgentId | 'core']> = [
       ['macro_scout', 'quant_analyst'],
       ['quant_analyst', 'orderflow_radar'],
-      ['orderflow_radar', 'risk_guardian'],
+      ['orderflow_radar', 'strategy_architect'],
+      ['strategy_architect', 'risk_guardian'],
       ['risk_guardian', 'execution_commander'],
       ['execution_commander', 'core'],
     ];
@@ -1262,8 +1295,14 @@ export class AgentWarRoomScene {
     }
   }
 
+  private resizeObserver: ResizeObserver | null = null;
+
   private bindEvents(): void {
     window.addEventListener('resize', this.handleResize);
+    if (typeof ResizeObserver !== 'undefined') {
+      this.resizeObserver = new ResizeObserver(() => this.handleResize());
+      this.resizeObserver.observe(this.container);
+    }
     this.renderer.domElement.addEventListener('pointerdown', this.handlePointerDown);
     this.renderer.domElement.addEventListener('pointermove', this.handlePointerMove);
     this.renderer.domElement.addEventListener('webglcontextlost', this.handleContextLost);
@@ -1438,13 +1477,18 @@ export class AgentWarRoomScene {
       if (id === 'orderflow_radar' && rig.accentMeshes[2]) {
         rig.accentMeshes[2].rotation.z = elapsed * 1.4 * speedMult;
       }
+      if (id === 'strategy_architect' && rig.accentMeshes[2]) {
+        rig.accentMeshes[2].rotation.y = elapsed * 1.5;
+        rig.accentMeshes[2].rotation.x = Math.sin(elapsed * 0.9) * 0.35;
+      }
       if (id === 'risk_guardian' && rig.accentMeshes[2]) {
         rig.accentMeshes[2].rotation.y = elapsed * 1.8;
       }
 
-      // Color status: VETO -> crimson, LONG -> emerald, SHORT -> rose, else role color
+      // Color status: UNAVAILABLE -> muted slate, VETO -> crimson, LONG -> emerald, SHORT -> rose, else role color
       let targetColor = AGENT_COLORS[id];
-      if (signal?.direction === 'VETO') targetColor = 0xef4444;
+      if (signal?.direction === 'UNAVAILABLE') targetColor = 0x64748b;
+      else if (signal?.direction === 'VETO') targetColor = 0xef4444;
       else if (signal?.direction === 'LONG' && isStageActive) targetColor = 0x10b981;
       else if (signal?.direction === 'SHORT' && isStageActive) targetColor = 0xf43f5e;
 
@@ -1452,7 +1496,13 @@ export class AgentWarRoomScene {
       rig.statusMaterial.color.lerp(_scratchColor, Math.min(1, dt * 6));
       rig.statusMaterial.emissive.lerp(_scratchColor, Math.min(1, dt * 6));
       rig.statusMaterial.emissiveIntensity =
-        isStageActive || isSelected ? 1.85 : isHovered ? 1.35 : 0.75;
+        signal?.direction === 'UNAVAILABLE'
+          ? 0.35
+          : isStageActive || isSelected
+            ? 1.85
+            : isHovered
+              ? 1.35
+              : 0.75;
 
       const haloMat = rig.haloMesh.material as THREE.MeshBasicMaterial;
       haloMat.opacity = THREE.MathUtils.damp(
@@ -1537,6 +1587,8 @@ export class AgentWarRoomScene {
     this.disposed = true;
     cancelAnimationFrame(this.frameId);
     clearTimeout(this.frameId);
+    this.resizeObserver?.disconnect();
+    this.resizeObserver = null;
     window.removeEventListener('resize', this.handleResize);
     this.renderer.domElement.removeEventListener('pointerdown', this.handlePointerDown);
     this.renderer.domElement.removeEventListener('pointermove', this.handlePointerMove);
