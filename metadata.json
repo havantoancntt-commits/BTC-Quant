@@ -1,0 +1,6 @@
+{
+  "name": "AegisBTC Quant",
+  "description": "Đội ngũ AI Agents giao dịch Bitcoin tự động từ A đến Z với quản trị rủi ro định lượng và mô phỏng hợp tác 3D trực quan.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
